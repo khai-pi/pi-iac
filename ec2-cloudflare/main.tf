@@ -21,7 +21,7 @@ data "cloudflare_zone" "domain" {
 # Create Cloudflare Tunnel
 resource "cloudflare_zero_trust_tunnel_cloudflared" "auto_tunnel" {
   account_id = var.cloudflare_account_id
-  name       = "aws-tunnel-${var.instance_name}"
+  name       = "tunnel-${var.instance_name}"
   secret     = random_id.tunnel_secret.b64_std
 }
 
