@@ -28,11 +28,6 @@ variable "cloudflare_subdomain" {
   default     = "pi-mini-server"
 }
 
-variable "tunnel_hostname" {
-  description = "Hostname for the Cloudflare Tunnel (e.g., app.example.com)"
-  type        = string
-}
-
 variable "cloudflare_account_id" {
   description = "Cloudflare Account ID"
   type        = string

@@ -20,5 +20,5 @@ output "tunnel_cname" {
 
 output "tunnel_url" {
   description = "Public URL for accessing application"
-  value       = "https://${var.tunnel_hostname}"
+  value       = "https://${var.cloudflare_subdomain}.${var.cloudflare_zone_domain}"
 }

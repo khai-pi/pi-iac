@@ -45,7 +45,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "auto_tunnel" {
     }
 
     ingress_rule {
-      hostname = var.tunnel_hostname
+      hostname = "${var.cloudflare_subdomain}.${var.cloudflare_zone_domain}"
       service  = "http://localhost:80"
     }
 
@@ -73,29 +73,29 @@ data "cloudinit_config" "tunnel_config" {
       runcmd : [
         # Create cloudflared directory FIRST
         "mkdir -p /etc/cloudflared",
-        
+
         # Write config files
         "cat > /etc/cloudflared/config.yml <<'EOT'\ntunnel: ${cloudflare_zero_trust_tunnel_cloudflared.auto_tunnel.id}\ncredentials-file: /etc/cloudflared/credentials.json\nEOT",
-        
+
         "cat > /etc/cloudflared/credentials.json <<'EOT'\n${jsonencode({
           AccountTag   = var.cloudflare_account_id
           TunnelSecret = random_id.tunnel_secret.b64_std
           TunnelID     = cloudflare_zero_trust_tunnel_cloudflared.auto_tunnel.id
         })}\nEOT",
-        
+
         # Set permissions
         "chmod 600 /etc/cloudflared/config.yml",
         "chmod 600 /etc/cloudflared/credentials.json",
-        
+
         # Install cloudflared
         "curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb",
         "dpkg -i /tmp/cloudflared.deb",
-        
+
         # Setup cloudflared as a service
         "cloudflared --config /etc/cloudflared/config.yml service install",
         "systemctl start cloudflared",
         "systemctl enable cloudflared",
-        
+
         # Setup nginx
         "echo '<h1>Hello from Cloudflare Tunnel on AWS!</h1>' > /var/www/html/index.html",
         "systemctl start nginx",
