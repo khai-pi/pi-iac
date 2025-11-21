@@ -24,6 +24,17 @@ resource "cloudflare_record" "tunnel_dns" {
   proxied = true
 }
 
+# Create wildcard DNS record for all subdomains
+# Need Total TLS or higher plan for wildcard proxying for more than one level of subdomains
+# https://developers.cloudflare.com/ssl/edge-certificates/additional-options/total-tls/error-messages/
+resource "cloudflare_record" "tunnel_dns_wildcard" {
+  zone_id = data.cloudflare_zone.domain.id
+  name    = "*.${var.cloudflare_subdomain}"
+  content = cloudflare_zero_trust_tunnel_cloudflared.auto_tunnel.cname
+  type    = "CNAME"
+  proxied = true
+}
+
 # Configure Cloudflare Tunnel
 resource "cloudflare_zero_trust_tunnel_cloudflared_config" "auto_tunnel" {
   account_id = var.cloudflare_account_id
@@ -36,6 +47,12 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "auto_tunnel" {
 
     ingress_rule {
       hostname = "${var.cloudflare_subdomain}.${var.cloudflare_zone_domain}"
+      service  = "http://localhost:80"
+    }
+
+    # Wildcard subdomains
+    ingress_rule {
+      hostname = "*.${var.cloudflare_subdomain}.${var.cloudflare_zone_domain}"
       service  = "http://localhost:80"
     }
 
