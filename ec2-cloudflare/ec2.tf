@@ -28,7 +28,7 @@ data "cloudinit_config" "tunnel_config" {
             # Main domain
             server {
                 listen 80;
-                server_name ${var.cloudflare_subdomain}.${var.cloudflare_zone_domain};
+                server_name ${var.cloudflare_zone_domain};
                 
                 location / {
                     root /var/www/html;
@@ -39,7 +39,7 @@ data "cloudinit_config" "tunnel_config" {
             # Example app subdomain
             server {
                 listen 80;
-                server_name app.${var.cloudflare_subdomain}.${var.cloudflare_zone_domain};
+                server_name fe.${var.cloudflare_zone_domain};
                 
                 location / {
                     proxy_pass http://localhost:3000;
@@ -57,10 +57,28 @@ data "cloudinit_config" "tunnel_config" {
             # Example API subdomain
             server {
                 listen 80;
-                server_name api.${var.cloudflare_subdomain}.${var.cloudflare_zone_domain};
+                server_name api.${var.cloudflare_zone_domain};
                 
                 location / {
                     proxy_pass http://localhost:4000;
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_cache_bypass $http_upgrade;
+                }
+            }
+
+            # n8n domain
+            server {
+                listen 80;
+                server_name n8n.${var.cloudflare_zone_domain};
+                
+                location / {
+                    proxy_pass http://localhost:5678;
                     proxy_http_version 1.1;
                     proxy_set_header Upgrade $http_upgrade;
                     proxy_set_header Connection 'upgrade';
@@ -112,7 +130,7 @@ data "cloudinit_config" "tunnel_config" {
         "systemctl enable cloudflared",
         
         # Setup nginx
-        "echo '<h1>Hello from Cloudflare Tunnel on AWS!</h1><p>Main domain: ${var.cloudflare_subdomain}.${var.cloudflare_zone_domain}</p>' > /var/www/html/index.html",
+        "echo '<h1>Hello from Cloudflare Tunnel on AWS!</h1><p>Main domain: ${var.cloudflare_zone_domain}</p>' > /var/www/html/index.html",
         
         # Remove default nginx config and enable our config
         "rm -f /etc/nginx/sites-enabled/default",

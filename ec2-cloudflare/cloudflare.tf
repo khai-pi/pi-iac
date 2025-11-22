@@ -18,7 +18,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared" "auto_tunnel" {
 # Create DNS record pointing to the tunnel
 resource "cloudflare_record" "tunnel_dns" {
   zone_id = data.cloudflare_zone.domain.id
-  name    = var.cloudflare_subdomain
+  name    = "@"
   content = cloudflare_zero_trust_tunnel_cloudflared.auto_tunnel.cname
   type    = "CNAME"
   proxied = true
@@ -29,7 +29,7 @@ resource "cloudflare_record" "tunnel_dns" {
 # https://developers.cloudflare.com/ssl/edge-certificates/additional-options/total-tls/error-messages/
 resource "cloudflare_record" "tunnel_dns_wildcard" {
   zone_id = data.cloudflare_zone.domain.id
-  name    = "*.${var.cloudflare_subdomain}"
+  name    = "*"
   content = cloudflare_zero_trust_tunnel_cloudflared.auto_tunnel.cname
   type    = "CNAME"
   proxied = true
@@ -46,13 +46,13 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "auto_tunnel" {
     }
 
     ingress_rule {
-      hostname = "${var.cloudflare_subdomain}.${var.cloudflare_zone_domain}"
+      hostname = "${var.cloudflare_zone_domain}"
       service  = "http://localhost:80"
     }
 
     # Wildcard subdomains
     ingress_rule {
-      hostname = "*.${var.cloudflare_subdomain}.${var.cloudflare_zone_domain}"
+      hostname = "*.${var.cloudflare_zone_domain}"
       service  = "http://localhost:80"
     }
 
