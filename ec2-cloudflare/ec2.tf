@@ -21,125 +21,31 @@ data "cloudinit_config" "tunnel_config" {
         "curl",
         "nginx"
       ]
+      # Copy files to the instance
       write_files : [
         {
           path : "/etc/nginx/sites-available/tunnel-proxy"
-          content : <<-EOT
-            # Main domain
-            server {
-                listen 80;
-                server_name ${var.cloudflare_zone_domain};
-                
-                location / {
-                    root /var/www/html;
-                    index index.html;
-                }
-            }
-
-            # Example app subdomain
-            server {
-                listen 80;
-                server_name fe.${var.cloudflare_zone_domain};
-                
-                location / {
-                    proxy_pass http://localhost:3000;
-                    proxy_http_version 1.1;
-                    proxy_set_header Upgrade $http_upgrade;
-                    proxy_set_header Connection 'upgrade';
-                    proxy_set_header Host $host;
-                    proxy_set_header X-Real-IP $remote_addr;
-                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                    proxy_set_header X-Forwarded-Proto $scheme;
-                    proxy_cache_bypass $http_upgrade;
-                }
-            }
-
-            # Example API subdomain
-            server {
-                listen 80;
-                server_name api.${var.cloudflare_zone_domain};
-                
-                location / {
-                    proxy_pass http://localhost:4000;
-                    proxy_http_version 1.1;
-                    proxy_set_header Upgrade $http_upgrade;
-                    proxy_set_header Connection 'upgrade';
-                    proxy_set_header Host $host;
-                    proxy_set_header X-Real-IP $remote_addr;
-                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                    proxy_set_header X-Forwarded-Proto $scheme;
-                    proxy_cache_bypass $http_upgrade;
-                }
-            }
-
-            # n8n domain
-            server {
-                listen 80;
-                server_name n8n.${var.cloudflare_zone_domain};
-                
-                location / {
-                    proxy_pass http://localhost:5678;
-                    proxy_http_version 1.1;
-                    proxy_set_header Upgrade $http_upgrade;
-                    proxy_set_header Connection 'upgrade';
-                    proxy_set_header Host $host;
-                    proxy_set_header X-Real-IP $remote_addr;
-                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                    proxy_set_header X-Forwarded-Proto $scheme;
-                    proxy_cache_bypass $http_upgrade;
-                }
-            }
-
-            # Default catch-all for undefined subdomains
-            server {
-                listen 80 default_server;
-                server_name _;
-                
-                location / {
-                    return 200 '<h1>Subdomain not configured</h1><p>Please configure this subdomain in nginx</p>';
-                    add_header Content-Type text/html;
-                }
-            }
-          EOT
+          content : templatefile("${path.module}/nginx-config.tpl", {
+            domain = var.cloudflare_zone_domain
+          })
           permissions : "0644"
+        },
+        {
+          path : "/tmp/setup-script.sh"
+          content : templatefile("${path.module}/setup-script.sh", {
+            tunnel_id       = cloudflare_zero_trust_tunnel_cloudflared.auto_tunnel.id
+            credentials_json = jsonencode({
+              AccountTag   = var.cloudflare_account_id
+              TunnelSecret = random_id.tunnel_secret.b64_std
+              TunnelID     = cloudflare_zero_trust_tunnel_cloudflared.auto_tunnel.id
+            })
+            domain = var.cloudflare_zone_domain
+          })
+          permissions : "0755"
         }
       ]
       runcmd : [
-        # Create cloudflared directory FIRST
-        "mkdir -p /etc/cloudflared",
-        
-        # Write config files
-        "cat > /etc/cloudflared/config.yml <<'EOT'\ntunnel: ${cloudflare_zero_trust_tunnel_cloudflared.auto_tunnel.id}\ncredentials-file: /etc/cloudflared/credentials.json\nEOT",
-        "cat > /etc/cloudflared/credentials.json <<'EOT'\n${jsonencode({
-          AccountTag   = var.cloudflare_account_id
-          TunnelSecret = random_id.tunnel_secret.b64_std
-          TunnelID     = cloudflare_zero_trust_tunnel_cloudflared.auto_tunnel.id
-        })}\nEOT",
-        
-        # Set permissions
-        "chmod 600 /etc/cloudflared/config.yml",
-        "chmod 600 /etc/cloudflared/credentials.json",
-        
-        # Install cloudflared
-        "curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb",
-        "dpkg -i /tmp/cloudflared.deb",
-        
-        # Setup cloudflared as a service
-        "cloudflared --config /etc/cloudflared/config.yml service install",
-        "systemctl start cloudflared",
-        "systemctl enable cloudflared",
-        
-        # Setup nginx
-        "echo '<h1>Hello from Cloudflare Tunnel on AWS!</h1><p>Main domain: ${var.cloudflare_zone_domain}</p>' > /var/www/html/index.html",
-        
-        # Remove default nginx config and enable our config
-        "rm -f /etc/nginx/sites-enabled/default",
-        "ln -s /etc/nginx/sites-available/tunnel-proxy /etc/nginx/sites-enabled/",
-        
-        # Test and restart nginx
-        "nginx -t",
-        "systemctl restart nginx",
-        "systemctl enable nginx"
+        "/tmp/setup-script.sh"
       ]
     })
   }
