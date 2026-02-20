@@ -1,0 +1,116 @@
+# ArgoCD Helm Values – Production
+# ============================================================
+
+global:
+  nodeSelector:
+    dedicated: system
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: system
+      effect: NoSchedule
+
+server:
+  replicas: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 5
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  # Expose via GKE Gateway / Ingress (not LoadBalancer)
+  service:
+    type: ClusterIP
+
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      kubernetes.io/tls-acme: "true"
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    hosts:
+      - argocd.internal.example.com
+    tls:
+      - secretName: argocd-tls
+        hosts:
+          - argocd.internal.example.com
+
+  # Metrics for Prometheus
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+
+repoServer:
+  replicas: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+applicationSet:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+redis:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+configs:
+  cm:
+    # OIDC / Google Workspace SSO
+    url: https://argocd.internal.example.com
+    dex.config: |
+      connectors:
+        - type: oidc
+          id: google
+          name: Google
+          config:
+            issuer: https://accounts.google.com
+            clientID: $oidc-client-id
+            clientSecret: $oidc-client-secret
+            redirectURI: https://argocd.internal.example.com/api/dex/callback
+            hostedDomains:
+              - example.com
+
+    # Sync policy
+    resource.compareoptions: |
+      ignoreAggregatedRoles: true
+    server.rbac.log.enforce.enable: "true"
+
+  rbac:
+    policy.default: role:readonly
+    policy.csv: |
+      p, role:platform-admin, applications, *, */*, allow
+      p, role:platform-admin, clusters, *, *, allow
+      p, role:platform-admin, repositories, *, *, allow
+      p, role:developer, applications, get, */*, allow
+      p, role:developer, applications, sync, */*, allow
+      g, platform-leads@example.com, role:platform-admin
+      g, developers@example.com, role:developer

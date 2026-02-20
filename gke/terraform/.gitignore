@@ -1,0 +1,18 @@
+# ============================================================
+# .terraform-version (use with tfenv)
+# ============================================================
+# 1.6.0
+
+# ============================================================
+# .gitignore – recommended for this repo
+# ============================================================
+# .terraform/
+# .terraform.lock.hcl
+# terraform.tfstate
+# terraform.tfstate.backup
+# terraform.tfvars          ← Never commit secrets
+# *.tfvars                  ← Except .example files
+# !*.tfvars.example
+# override.tf
+# override.tf.json
+# crash.log

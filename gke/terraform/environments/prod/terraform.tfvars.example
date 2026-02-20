@@ -1,0 +1,41 @@
+# ============================================================
+# Production Environment Configuration
+# Copy this file to terraform.tfvars and fill in your values.
+# Never commit terraform.tfvars to version control.
+# ============================================================
+
+org_name = "myorg"
+org_id   = "123456789012"
+
+# Project IDs
+host_project_id            = "myorg-shared-vpc-prod"
+cluster_project_id         = "myorg-gke-prod"
+shared_services_project_id = "myorg-shared-services"
+
+# Regions
+primary_region = "europe-west1"
+dr_region      = "us-central1"
+
+# Control plane CIDRs (/28 required, must not overlap)
+primary_master_cidr = "172.16.0.0/28"
+dr_master_cidr      = "172.16.0.16/28"
+
+# Restrict API server access to your VPN / on-prem range
+master_authorized_networks = [
+  "10.0.0.0/8",      # Internal VPC
+  "192.168.1.0/24",  # VPN / bastion range
+]
+
+# Cloud Armor: restrict to your known IP ranges in prod
+allowed_ip_ranges = [
+  "0.0.0.0/0",  # Replace with your CDN/edge IP ranges in prod
+]
+
+internal_domain = "internal.example.com"
+
+# CI/CD service account (created separately for Cloud Build / GitHub Actions)
+cicd_service_account_email = "cicd-sa@myorg-shared-services.iam.gserviceaccount.com"
+
+# ArgoCD admin password (bcrypt hash)
+# Generate with: htpasswd -nbBC 10 "" your-password | tr -d ':\n' | sed 's/$2y/$2a/'
+argocd_admin_password = "$2a$10$REPLACE_WITH_BCRYPT_HASH"
