@@ -1,0 +1,95 @@
+# ============================================================
+# cert-manager ClusterIssuers
+# Production and staging Let's Encrypt + internal CA.
+# ============================================================
+
+---
+# ── Let's Encrypt Production ─────────────────────────────────
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: platform-team@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - dns01:
+          cloudDNS:
+            project: myorg-shared-vpc-prod
+            # Uses Workload Identity — no key needed
+        selector:
+          dnsZones:
+            - "example.com"
+            - "internal.example.com"
+
+---
+# ── Let's Encrypt Staging (for testing / rate limit avoidance)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: platform-team@example.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - dns01:
+          cloudDNS:
+            project: myorg-shared-vpc-prod
+        selector:
+          dnsZones:
+            - "example.com"
+            - "internal.example.com"
+
+---
+# ── Internal CA (for cluster-internal services) ───────────────
+# Uses Google Certificate Authority Service
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: internal-ca
+spec:
+  googleCASIssuer:
+    project: myorg-gke-prod
+    location: europe-west1
+    caPoolId: platform-ca-pool
+    # Uses Workload Identity of cert-manager controller SA
+
+---
+# ── Platform TLS Certificate — ArgoCD ────────────────────────
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: argocd-tls
+  namespace: argocd
+spec:
+  secretName: argocd-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - argocd.internal.example.com
+  duration: 2160h    # 90 days
+  renewBefore: 720h  # renew 30 days before expiry
+
+---
+# ── Platform TLS Certificate — Grafana ───────────────────────
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: grafana-tls
+  namespace: monitoring
+spec:
+  secretName: grafana-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - grafana.internal.example.com
+  duration: 2160h
+  renewBefore: 720h

@@ -1,0 +1,243 @@
+# ============================================================
+# PrometheusRule — Platform Alerting Rules
+# Covers: node health, pod health, quota, certificates,
+# SLOs, security, and cost.
+# ============================================================
+
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: platform-pod-monitoring
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      monitoring: "true"
+  endpoints:
+    - port: metrics
+      interval: 30s
+
+---
+# Custom PrometheusRule for Managed Prometheus
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: platform-alerts
+  namespace: monitoring
+spec:
+  groups:
+    # ── Infrastructure Alerts ─────────────────────────────
+    - name: infrastructure
+      interval: 30s
+      rules:
+        - alert: NodeNotReady
+          expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+          for: 5m
+          labels:
+            severity: P2
+            team: platform
+          annotations:
+            summary: "Node {{ $labels.node }} is NotReady"
+            description: "Node {{ $labels.node }} has been NotReady for more than 5 minutes."
+            runbook: "https://github.com/org/k8s-config/blob/main/docs/runbooks/node-not-ready.md"
+
+        - alert: NodeDiskPressure
+          expr: kube_node_status_condition{condition="DiskPressure",status="true"} == 1
+          for: 2m
+          labels:
+            severity: P2
+            team: platform
+          annotations:
+            summary: "Node {{ $labels.node }} has disk pressure"
+            runbook: "https://github.com/org/k8s-config/blob/main/docs/runbooks/node-not-ready.md"
+
+        - alert: NodeMemoryPressure
+          expr: kube_node_status_condition{condition="MemoryPressure",status="true"} == 1
+          for: 2m
+          labels:
+            severity: P2
+            team: platform
+          annotations:
+            summary: "Node {{ $labels.node }} has memory pressure"
+
+        - alert: NodeHighCPU
+          expr: |
+            (sum(rate(node_cpu_seconds_total{mode!="idle"}[5m])) by (node))
+            / (sum(kube_node_status_capacity{resource="cpu"}) by (node)) > 0.90
+          for: 15m
+          labels:
+            severity: P3
+            team: platform
+          annotations:
+            summary: "Node {{ $labels.node }} CPU > 90% for 15 minutes"
+
+    # ── Pod / Workload Alerts ─────────────────────────────
+    - name: workloads
+      interval: 30s
+      rules:
+        - alert: PodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total[15m]) * 60 * 15 > 5
+          for: 5m
+          labels:
+            severity: P2
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is crash looping"
+            description: "Container {{ $labels.container }} restarted {{ $value | humanize }} times in 15m."
+            runbook: "https://github.com/org/k8s-config/blob/main/docs/runbooks/crashloop.md"
+
+        - alert: PodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+          labels:
+            severity: P3
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Container {{ $labels.container }} in {{ $labels.namespace }} was OOMKilled"
+            description: "Increase the memory limit for this container."
+
+        - alert: PodNotReady
+          expr: |
+            sum by (namespace, pod) (
+              kube_pod_status_ready{condition="true"} == 0
+              and kube_pod_status_phase{phase=~"Running|Pending"} == 1
+            ) > 0
+          for: 10m
+          labels:
+            severity: P3
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} not ready for 10m"
+
+        - alert: DeploymentReplicasMismatch
+          expr: |
+            kube_deployment_spec_replicas != kube_deployment_status_ready_replicas
+          for: 15m
+          labels:
+            severity: P2
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} has replica mismatch"
+
+        - alert: HpaAtMaxReplicas
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas
+            == kube_horizontalpodautoscaler_spec_max_replicas
+          for: 15m
+          labels:
+            severity: P3
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "HPA {{ $labels.namespace }}/{{ $labels.horizontalpodautoscaler }} at max replicas"
+            description: "Consider increasing maxReplicas or investigating load."
+
+    # ── Resource Quota Alerts ─────────────────────────────
+    - name: quotas
+      interval: 60s
+      rules:
+        - alert: NamespaceQuotaCPUHigh
+          expr: |
+            (kube_resourcequota{resource="requests.cpu", type="used"}
+            / kube_resourcequota{resource="requests.cpu", type="hard"}) > 0.80
+          labels:
+            severity: P3
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "CPU quota in {{ $labels.namespace }} is above 80%"
+
+        - alert: NamespaceQuotaMemoryHigh
+          expr: |
+            (kube_resourcequota{resource="requests.memory", type="used"}
+            / kube_resourcequota{resource="requests.memory", type="hard"}) > 0.80
+          labels:
+            severity: P3
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Memory quota in {{ $labels.namespace }} is above 80%"
+
+        - alert: NamespaceQuotaPodHigh
+          expr: |
+            (kube_resourcequota{resource="count/pods", type="used"}
+            / kube_resourcequota{resource="count/pods", type="hard"}) > 0.80
+          labels:
+            severity: P3
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Pod quota in {{ $labels.namespace }} is above 80%"
+
+    # ── Certificate Alerts ────────────────────────────────
+    - name: certificates
+      interval: 300s
+      rules:
+        - alert: CertificateExpiresWithin7Days
+          expr: |
+            certmanager_certificate_expiration_timestamp_seconds
+            - time() < 7 * 24 * 3600
+          labels:
+            severity: P2
+            team: platform
+          annotations:
+            summary: "Certificate {{ $labels.namespace }}/{{ $labels.name }} expires in < 7 days"
+            runbook: "https://github.com/org/k8s-config/blob/main/docs/runbooks/cert-rotation.md"
+
+        - alert: CertificateNotReady
+          expr: certmanager_certificate_ready_status{condition="True"} == 0
+          for: 15m
+          labels:
+            severity: P2
+            team: platform
+          annotations:
+            summary: "Certificate {{ $labels.namespace }}/{{ $labels.name }} is not ready"
+
+    # ── SLO Alerts ────────────────────────────────────────
+    - name: slos
+      interval: 30s
+      rules:
+        - alert: HighErrorRate
+          expr: |
+            sum(rate(http_requests_total{status=~"5.."}[5m])) by (namespace, service)
+            / sum(rate(http_requests_total[5m])) by (namespace, service) > 0.01
+          for: 5m
+          labels:
+            severity: P2
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "Error rate > 1% for {{ $labels.namespace }}/{{ $labels.service }}"
+
+        - alert: HighLatencyP99
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket[5m])) by (le, namespace, service)
+            ) > 1.0
+          for: 5m
+          labels:
+            severity: P3
+            team: "{{ $labels.namespace }}"
+          annotations:
+            summary: "P99 latency > 1s for {{ $labels.namespace }}/{{ $labels.service }}"
+
+    # ── ArgoCD Health Alerts ──────────────────────────────
+    - name: argocd
+      interval: 60s
+      rules:
+        - alert: ArgoCDAppDegraded
+          expr: |
+            argocd_app_info{health_status="Degraded"} == 1
+          for: 5m
+          labels:
+            severity: P2
+            team: platform
+          annotations:
+            summary: "ArgoCD app {{ $labels.name }} is Degraded"
+
+        - alert: ArgoCDAppOutOfSync
+          expr: |
+            argocd_app_info{sync_status="OutOfSync"} == 1
+          for: 30m
+          labels:
+            severity: P3
+            team: platform
+          annotations:
+            summary: "ArgoCD app {{ $labels.name }} has been OutOfSync for 30 minutes"

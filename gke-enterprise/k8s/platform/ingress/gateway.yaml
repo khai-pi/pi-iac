@@ -1,0 +1,125 @@
+# ============================================================
+# GKE Gateway API
+# Platform-managed Gateway — shared by all teams.
+# Teams create HTTPRoutes pointing to this Gateway.
+# ============================================================
+
+---
+# GatewayClass — uses GKE's implementation
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: gke-l7-global-external-managed
+spec:
+  controllerName: networking.gke.io/gateway
+
+---
+# Shared external Gateway (internet-facing)
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: platform-external-gateway
+  namespace: ingress
+  annotations:
+    networking.gke.io/certmap: platform-cert-map    # GCP Certificate Map
+    networking.gke.io/security-policy: myorg-prod-waf-policy  # Cloud Armor
+spec:
+  gatewayClassName: gke-l7-global-external-managed
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: platform-wildcard-tls
+            namespace: ingress
+      allowedRoutes:
+        namespaces:
+          from: All    # all namespaces can attach HTTPRoutes
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+
+---
+# HTTP → HTTPS redirect
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: http-redirect
+  namespace: ingress
+spec:
+  parentRefs:
+    - name: platform-external-gateway
+      sectionName: http
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+
+---
+# Internal Gateway (for platform services: ArgoCD, Grafana)
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: platform-internal-gateway
+  namespace: ingress
+  annotations:
+    networking.gke.io/certmap: platform-internal-cert-map
+spec:
+  gatewayClassName: gke-l7-regional-internal-managed
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: platform-internal-tls
+            namespace: ingress
+      allowedRoutes:
+        namespaces:
+          from: All
+
+---
+# Platform HTTPRoutes
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: argocd-route
+  namespace: argocd
+spec:
+  parentRefs:
+    - name: platform-internal-gateway
+      namespace: ingress
+  hostnames:
+    - "argocd.internal.example.com"
+  rules:
+    - backendRefs:
+        - name: argocd-server
+          port: 80
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: grafana-route
+  namespace: monitoring
+spec:
+  parentRefs:
+    - name: platform-internal-gateway
+      namespace: ingress
+  hostnames:
+    - "grafana.internal.example.com"
+  rules:
+    - backendRefs:
+        - name: grafana
+          port: 80

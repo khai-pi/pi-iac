@@ -1,0 +1,151 @@
+name: k8s-config CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  KUBEVAL_VERSION: "0.16.1"
+  CONFTEST_VERSION: "0.46.0"
+  KUBE_SCORE_VERSION: "1.17.0"
+
+jobs:
+  # ── Validate manifests ──────────────────────────────────────
+  validate:
+    name: Validate Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeval
+        run: |
+          wget -q https://github.com/instrumenta/kubeval/releases/download/v${KUBEVAL_VERSION}/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          sudo mv kubeval /usr/local/bin/
+
+      - name: Install conftest
+        run: |
+          wget -q https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz
+          tar xzf conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin/
+
+      - name: Install kube-score
+        run: |
+          wget -q https://github.com/zegl/kube-score/releases/download/v${KUBE_SCORE_VERSION}/kube-score_${KUBE_SCORE_VERSION}_linux_amd64.tar.gz
+          tar xzf kube-score_${KUBE_SCORE_VERSION}_linux_amd64.tar.gz
+          sudo mv kube-score /usr/local/bin/
+
+      - name: Schema validation (kubeval)
+        run: |
+          find . -name '*.yaml' -not -path './.github/*' | \
+            xargs kubeval \
+              --strict \
+              --ignore-missing-schemas \
+              --kubernetes-version 1.29.0
+
+      - name: OPA policy checks (conftest)
+        run: |
+          find . -name '*.yaml' -not -path './.github/*' | \
+            xargs conftest test \
+              --policy policy/ \
+              --data policy/data/
+
+      - name: Best practices (kube-score)
+        run: |
+          find apps namespaces -name '*.yaml' | \
+            xargs kube-score score \
+              --ignore-test pod-probes \
+              --output-format ci
+
+  # ── Helm lint ───────────────────────────────────────────────
+  helm-lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Lint Helm values files
+        run: |
+          # Lint any Helm chart value overrides
+          find . -name 'values*.yaml' -not -path './.github/*' | while read f; do
+            echo "Linting $f"
+            helm lint "$(dirname $f)" --values "$f" || true
+          done
+
+  # ── Diff (on PR only) ───────────────────────────────────────
+  diff:
+    name: Show Diff vs Cluster
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_CI_SA }}
+
+      - name: Get cluster credentials
+        run: |
+          gcloud container clusters get-credentials prod-cluster-primary \
+            --region=europe-west1 \
+            --project=myorg-gke-prod
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Show ArgoCD diff
+        run: |
+          argocd app diff --local . \
+            --server argocd.internal.example.com \
+            --auth-token ${{ secrets.ARGOCD_CI_TOKEN }} \
+            --grpc-web || true   # non-zero exit if diff exists — that's expected on PR
+
+  # ── Auto-sync on merge to main ──────────────────────────────
+  sync:
+    name: Trigger ArgoCD Sync
+    runs-on: ubuntu-latest
+    needs: [validate, helm-lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_CI_SA }}
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Sync all apps
+        run: |
+          argocd app sync \
+            --server argocd.internal.example.com \
+            --auth-token ${{ secrets.ARGOCD_CI_TOKEN }} \
+            --grpc-web \
+            --label "managed-by=argocd" \
+            --async   # async — ArgoCD handles ordering via sync-wave annotations
+
+      - name: Wait for sync to complete
+        run: |
+          argocd app wait \
+            --server argocd.internal.example.com \
+            --auth-token ${{ secrets.ARGOCD_CI_TOKEN }} \
+            --grpc-web \
+            --label "managed-by=argocd" \
+            --health \
+            --timeout 300

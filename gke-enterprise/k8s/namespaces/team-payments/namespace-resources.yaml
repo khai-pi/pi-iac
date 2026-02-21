@@ -1,0 +1,322 @@
+# ============================================================
+# Namespace: team-payments
+# ResourceQuota, LimitRange, NetworkPolicies, RBAC,
+# ExternalSecrets, ServiceAccount (Workload Identity)
+# ============================================================
+
+---
+# ── ResourceQuota ────────────────────────────────────────────
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: payments-quota
+  namespace: team-payments
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+    count/pods: "100"
+    count/services: "30"
+    count/secrets: "100"
+    count/configmaps: "100"
+    persistentvolumeclaims: "20"
+    requests.storage: 1Ti
+    count/deployments.apps: "30"
+    count/statefulsets.apps: "10"
+    count/jobs.batch: "20"
+    count/cronjobs.batch: "10"
+
+---
+# ── LimitRange ───────────────────────────────────────────────
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: payments-limits
+  namespace: team-payments
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "8"
+        memory: 16Gi
+      min:
+        cpu: 10m
+        memory: 32Mi
+    - type: Pod
+      max:
+        cpu: "16"
+        memory: 32Gi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 200Gi
+
+---
+# ── NetworkPolicies ──────────────────────────────────────────
+
+# Default deny all ingress and egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: team-payments
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+# Allow intra-namespace traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: team-payments
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+# Allow DNS resolution (required for all pods)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: team-payments
+spec:
+  podSelector: {}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+  policyTypes: [Egress]
+
+---
+# Allow ingress from the Gateway/Ingress controller
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-gateway
+  namespace: team-payments
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress
+  policyTypes: [Ingress]
+
+---
+# Allow Prometheus scraping from monitoring namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: team-payments
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+        - port: 15090   # Istio metrics
+          protocol: TCP
+  policyTypes: [Ingress]
+
+---
+# Allow egress to GCP APIs (Secret Manager, Spanner, Pub/Sub)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gcp-apis-egress
+  namespace: team-payments
+spec:
+  podSelector: {}
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32  # GKE metadata server
+  policyTypes: [Egress]
+
+---
+# Allow payments → identity namespace (auth calls)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-to-identity
+  namespace: team-payments
+spec:
+  podSelector:
+    matchLabels:
+      needs-auth: "true"
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: team-identity
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+  policyTypes: [Egress]
+
+---
+# ── RBAC ─────────────────────────────────────────────────────
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: namespace-admin
+  namespace: team-payments
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: developer
+  namespace: team-payments
+rules:
+  - apiGroups: ["", "apps", "batch", "autoscaling", "networking.k8s.io",
+                "argoproj.io", "policy"]
+    resources: ["pods", "pods/log", "pods/exec", "pods/portforward",
+                "deployments", "replicasets", "statefulsets", "daemonsets",
+                "services", "endpoints", "configmaps", "events",
+                "horizontalpodautoscalers", "ingresses", "cronjobs", "jobs",
+                "poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["update", "patch"]   # allow image updates via ArgoCD CLI
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/portforward"]
+    verbs: ["create"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["rollouts", "rollouts/status"]
+    verbs: ["get", "list", "watch", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: viewer
+  namespace: team-payments
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: payments-admins
+  namespace: team-payments
+subjects:
+  - kind: Group
+    name: payments-leads@example.com
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: namespace-admin
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: payments-developers
+  namespace: team-payments
+subjects:
+  - kind: Group
+    name: payments-devs@example.com
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: developer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── Workload Identity Service Account ────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payments-ksa
+  namespace: team-payments
+  annotations:
+    iam.gke.io/gcp-service-account: payments-gsa@myorg-gke-prod.iam.gserviceaccount.com
+
+---
+# ── ExternalSecrets ──────────────────────────────────────────
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: payments-db-credentials
+  namespace: team-payments
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-secretmanager
+    kind: ClusterSecretStore
+  target:
+    name: payments-db-credentials
+    creationPolicy: Owner
+    template:
+      type: Opaque
+  data:
+    - secretKey: host
+      remoteRef:
+        key: payments-db-host
+    - secretKey: username
+      remoteRef:
+        key: payments-db-username
+    - secretKey: password
+      remoteRef:
+        key: payments-db-password
+
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: payments-stripe-key
+  namespace: team-payments
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-secretmanager
+    kind: ClusterSecretStore
+  target:
+    name: payments-stripe-key
+    creationPolicy: Owner
+  data:
+    - secretKey: api-key
+      remoteRef:
+        key: payments-stripe-api-key

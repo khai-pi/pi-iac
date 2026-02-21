@@ -1,0 +1,282 @@
+# ============================================================
+# Namespace: team-data
+# Higher memory/storage quotas for data-heavy workloads.
+# ============================================================
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: data-quota
+  namespace: team-data
+spec:
+  hard:
+    requests.cpu: "30"
+    requests.memory: 80Gi
+    limits.cpu: "60"
+    limits.memory: 160Gi
+    count/pods: "80"
+    count/services: "20"
+    count/secrets: "50"
+    count/configmaps: "80"
+    persistentvolumeclaims: "30"
+    requests.storage: 5Ti
+    count/deployments.apps: "20"
+    count/statefulsets.apps: "10"
+    count/jobs.batch: "50"
+    count/cronjobs.batch: "20"
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: data-limits
+  namespace: team-data
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: 2Gi
+      defaultRequest:
+        cpu: 250m
+        memory: 512Mi
+      max:
+        cpu: "16"
+        memory: 64Gi
+      min:
+        cpu: 50m
+        memory: 64Mi
+    - type: Pod
+      max:
+        cpu: "32"
+        memory: 128Gi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 2Ti
+
+---
+# Default deny all
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: team-data
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: team-data
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: team-data
+spec:
+  podSelector: {}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+  policyTypes: [Egress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-gateway
+  namespace: team-data
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress
+  policyTypes: [Ingress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: team-data
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+        - port: 8080
+        - port: 15090
+  policyTypes: [Ingress]
+
+---
+# Allow egress to GCP APIs — BigQuery, GCS, Pub/Sub, Dataflow
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gcp-apis-egress
+  namespace: team-data
+spec:
+  podSelector: {}
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 80
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+  policyTypes: [Egress]
+
+---
+# RBAC
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: namespace-admin
+  namespace: team-data
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: developer
+  namespace: team-data
+rules:
+  - apiGroups: ["", "apps", "batch", "autoscaling", "argoproj.io"]
+    resources: ["pods", "pods/log", "pods/exec", "pods/portforward",
+                "deployments", "replicasets", "statefulsets", "services",
+                "configmaps", "events", "horizontalpodautoscalers",
+                "jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/portforward"]
+    verbs: ["create"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "delete"]   # data team can trigger manual jobs
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: data-admins
+  namespace: team-data
+subjects:
+  - kind: Group
+    name: data-leads@example.com
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: namespace-admin
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: data-developers
+  namespace: team-data
+subjects:
+  - kind: Group
+    name: data-devs@example.com
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: developer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Workload Identity SA — BigQuery + GCS + Pub/Sub access
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: data-ksa
+  namespace: team-data
+  annotations:
+    iam.gke.io/gcp-service-account: data-gsa@myorg-gke-prod.iam.gserviceaccount.com
+
+---
+# Separate SA for ETL jobs with write access
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: data-etl-ksa
+  namespace: team-data
+  annotations:
+    iam.gke.io/gcp-service-account: data-etl-gsa@myorg-gke-prod.iam.gserviceaccount.com
+
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: data-pubsub-credentials
+  namespace: team-data
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-secretmanager
+    kind: ClusterSecretStore
+  target:
+    name: data-pubsub-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: topic-id
+      remoteRef:
+        key: data-pubsub-topic-id
+    - secretKey: subscription-id
+      remoteRef:
+        key: data-pubsub-subscription-id
+
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: data-warehouse-credentials
+  namespace: team-data
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-secretmanager
+    kind: ClusterSecretStore
+  target:
+    name: data-warehouse-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: project-id
+      remoteRef:
+        key: data-bigquery-project-id
+    - secretKey: dataset-id
+      remoteRef:
+        key: data-bigquery-dataset-id

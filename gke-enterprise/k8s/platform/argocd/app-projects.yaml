@@ -1,0 +1,129 @@
+# ============================================================
+# ArgoCD AppProjects
+# Projects define which repos/clusters/namespaces each
+# ArgoCD app can deploy to. Enforces least-privilege.
+# ============================================================
+
+---
+# Platform project — platform team only
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+spec:
+  description: Platform infrastructure components
+  sourceRepos:
+    - "https://github.com/org/k8s-config"
+    - "https://argoproj.github.io/argo-helm"
+    - "https://charts.jetstack.io"
+    - "https://charts.external-secrets.io"
+    - "https://kubernetes-sigs.github.io/metrics-server/"
+    - "https://charts.fairwinds.com/stable"
+  destinations:
+    - namespace: "*"
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  roles:
+    - name: platform-admin
+      policies:
+        - p, proj:platform:platform-admin, applications, *, platform/*, allow
+      groups:
+        - platform-leads@example.com
+
+---
+# Payments team project
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: team-payments
+  namespace: argocd
+spec:
+  description: Applications for the Payments team
+  sourceRepos:
+    - "https://github.com/org/k8s-config"
+    - "https://github.com/org/app-payments-*"
+    - "https://europe-west1-docker.pkg.dev/myorg-shared-services/myorg-prod-helm-charts"
+  destinations:
+    - namespace: team-payments
+      server: https://kubernetes.default.svc
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  clusterResourceBlacklist:
+    - group: "*"
+      kind: "*"
+  roles:
+    - name: developer
+      policies:
+        - p, proj:team-payments:developer, applications, get, team-payments/*, allow
+        - p, proj:team-payments:developer, applications, sync, team-payments/*, allow
+        - p, proj:team-payments:developer, applications, action/*, team-payments/*, allow
+      groups:
+        - payments-devs@example.com
+        - payments-leads@example.com
+
+---
+# Identity team project
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: team-identity
+  namespace: argocd
+spec:
+  description: Applications for the Identity team
+  sourceRepos:
+    - "https://github.com/org/k8s-config"
+    - "https://github.com/org/app-identity-*"
+  destinations:
+    - namespace: team-identity
+      server: https://kubernetes.default.svc
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  clusterResourceBlacklist:
+    - group: "*"
+      kind: "*"
+  roles:
+    - name: developer
+      policies:
+        - p, proj:team-identity:developer, applications, get, team-identity/*, allow
+        - p, proj:team-identity:developer, applications, sync, team-identity/*, allow
+      groups:
+        - identity-devs@example.com
+        - identity-leads@example.com
+
+---
+# Data team project
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: team-data
+  namespace: argocd
+spec:
+  description: Applications for the Data team
+  sourceRepos:
+    - "https://github.com/org/k8s-config"
+    - "https://github.com/org/app-data-*"
+  destinations:
+    - namespace: team-data
+      server: https://kubernetes.default.svc
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  clusterResourceBlacklist:
+    - group: "*"
+      kind: "*"
+  roles:
+    - name: developer
+      policies:
+        - p, proj:team-data:developer, applications, get, team-data/*, allow
+        - p, proj:team-data:developer, applications, sync, team-data/*, allow
+      groups:
+        - data-devs@example.com
+        - data-leads@example.com

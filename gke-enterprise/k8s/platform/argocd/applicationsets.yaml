@@ -1,0 +1,180 @@
+# ============================================================
+# ArgoCD ApplicationSets
+# ApplicationSets template Applications across namespaces,
+# clusters, and environments automatically.
+# ============================================================
+
+---
+# ── Platform components ApplicationSet ──────────────────────
+# One Application per directory under platform/
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: platform-components
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/org/k8s-config
+        revision: HEAD
+        directories:
+          - path: platform/*
+  template:
+    metadata:
+      name: "platform-{{path.basename}}"
+      namespace: argocd
+      annotations:
+        argocd.argoproj.io/sync-wave: "-10"  # sync platform before apps
+    spec:
+      project: platform
+      source:
+        repoURL: https://github.com/org/k8s-config
+        targetRevision: HEAD
+        path: "{{path}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{path.basename}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=false
+          - ServerSideApply=true
+          - RespectIgnoreDifferences=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+---
+# ── Team namespace resources ApplicationSet ─────────────────
+# One Application per team namespace (quotas, RBAC, netpols)
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: team-namespaces
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/org/k8s-config
+        revision: HEAD
+        directories:
+          - path: namespaces/*
+  template:
+    metadata:
+      name: "ns-{{path.basename}}"
+      namespace: argocd
+      annotations:
+        argocd.argoproj.io/sync-wave: "-5"
+    spec:
+      project: platform
+      source:
+        repoURL: https://github.com/org/k8s-config
+        targetRevision: HEAD
+        path: "{{path}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{path.basename}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=false
+          - ServerSideApply=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 1m
+
+---
+# ── Team applications ApplicationSet ────────────────────────
+# Reads app list from a config file per team
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: team-apps
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/org/k8s-config
+        revision: HEAD
+        directories:
+          - path: apps/*/*
+  template:
+    metadata:
+      name: "{{path[1]}}-{{path.basename}}"
+      namespace: argocd
+    spec:
+      project: "{{path[1]}}"
+      source:
+        repoURL: https://github.com/org/k8s-config
+        targetRevision: HEAD
+        path: "{{path}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{path[1]}}"
+      syncPolicy:
+        automated:
+          prune: false       # apps: never auto-delete — require explicit removal
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=false
+          - ServerSideApply=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 2m
+      revisionHistoryLimit: 10
+
+---
+# ── Cluster-level resources ApplicationSet ──────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cluster-resources
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/org/k8s-config
+        revision: HEAD
+        directories:
+          - path: cluster/*
+  template:
+    metadata:
+      name: "cluster-{{path.basename}}"
+      namespace: argocd
+      annotations:
+        argocd.argoproj.io/sync-wave: "-20"  # first to sync
+    spec:
+      project: platform
+      source:
+        repoURL: https://github.com/org/k8s-config
+        targetRevision: HEAD
+        path: "{{path}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: default
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=false
+          - ServerSideApply=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

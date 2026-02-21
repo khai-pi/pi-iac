@@ -1,0 +1,132 @@
+# ============================================================
+# Anthos Service Mesh — mTLS and AuthorizationPolicies
+# ============================================================
+
+---
+# ── Global mTLS: STRICT mode for all namespaces ──────────────
+# Rejects plain-text connections cluster-wide.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default-mtls-strict
+  namespace: istio-system   # istio-system scope = cluster-wide
+spec:
+  mtls:
+    mode: STRICT
+
+---
+# ── Exception: allow plain-text for health checks from GKE ───
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: allow-healthcheck
+  namespace: kube-system
+spec:
+  mtls:
+    mode: PERMISSIVE
+
+---
+# ── AuthorizationPolicy: deny all by default ─────────────────
+# Explicit allow policies must be created per service.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: istio-system   # cluster-wide
+spec: {}                    # empty spec = deny all
+
+---
+# ── Allow traffic from ingress gateway ───────────────────────
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingress-gateway
+  namespace: istio-system
+spec:
+  selector:
+    matchLabels: {}          # all workloads
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/ingress/sa/gateway-sa"
+
+---
+# ── Allow prometheus scraping ────────────────────────────────
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: monitoring
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["monitoring"]
+      to:
+        - operation:
+            ports: ["9090", "9091", "8080", "15090"]
+
+---
+# ── Sidecar: restrict egress to known services ───────────────
+# Applied to all namespaces — limits pods to cluster-internal
+# and GCP API endpoints only.
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: default-sidecar
+  namespace: istio-system
+spec:
+  egress:
+    - hosts:
+        - "./*"                      # same namespace
+        - "istio-system/*"           # mesh control plane
+        - "monitoring/*"             # metrics
+        - "external/*"               # see ServiceEntry below
+
+---
+# ── ServiceEntry: allow egress to GCP APIs ───────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: gcp-apis
+  namespace: istio-system
+spec:
+  hosts:
+    - "*.googleapis.com"
+    - "metadata.google.internal"
+  ports:
+    - number: 443
+      name: https
+      protocol: HTTPS
+    - number: 80
+      name: http
+      protocol: HTTP
+  location: MESH_EXTERNAL
+  resolution: DNS
+
+---
+# ── DestinationRule: enable mTLS for all internal services ───
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: default-mtls
+  namespace: istio-system
+spec:
+  host: "*.svc.cluster.local"
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 10
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50

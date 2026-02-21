@@ -1,0 +1,443 @@
+# ============================================================
+# team-data — Pipeline API, ETL CronJob, Spark Batch Job
+# Demonstrates: long-running API, scheduled batch, one-off job
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# 1. pipeline-api — REST API for querying pipeline status
+# ─────────────────────────────────────────────────────────────
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-api-config
+  namespace: team-data
+  labels:
+    app: pipeline-api
+    team: data
+data:
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  HTTP_PORT: "8080"
+  METRICS_PORT: "9091"
+  BIGQUERY_LOCATION: "EU"
+  CACHE_TTL: "300s"
+  OTEL_SERVICE_NAME: "pipeline-api"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.monitoring.svc.cluster.local:4317"
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: pipeline-api
+  namespace: team-data
+  labels:
+    app: pipeline-api
+    team: data
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: pipeline-api
+  template:
+    metadata:
+      labels:
+        app: pipeline-api
+        team: data
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+    spec:
+      serviceAccountName: data-ksa
+      nodeSelector:
+        cloud.google.com/gke-nodepool: general-pool
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: pipeline-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pipeline-api
+          image: europe-west1-docker.pkg.dev/myorg-shared-services/myorg-prod-containers/pipeline-api:1.0.0
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9091
+          envFrom:
+            - configMapRef:
+                name: pipeline-api-config
+          env:
+            - name: BQ_PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: data-warehouse-credentials
+                  key: project-id
+            - name: BQ_DATASET_ID
+              valueFrom:
+                secretKeyRef:
+                  name: data-warehouse-credentials
+                  key: dataset-id
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: query-cache
+              mountPath: /var/cache/queries
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: query-cache
+          emptyDir:
+            sizeLimit: 1Gi
+      terminationGracePeriodSeconds: 45
+  strategy:
+    canary:
+      steps:
+        - setWeight: 20
+        - pause: {duration: 10m}
+        - setWeight: 100
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pipeline-api
+  namespace: team-data
+  labels:
+    app: pipeline-api
+spec:
+  selector:
+    app: pipeline-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: metrics
+      port: 9091
+  type: ClusterIP
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: pipeline-api
+  namespace: team-data
+spec:
+  parentRefs:
+    - name: platform-internal-gateway
+      namespace: ingress
+  hostnames:
+    - "pipelines.internal.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/pipelines
+      backendRefs:
+        - name: pipeline-api
+          port: 80
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: pipeline-api-hpa
+  namespace: team-data
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: pipeline-api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pipeline-api-pdb
+  namespace: team-data
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: pipeline-api
+
+
+# ─────────────────────────────────────────────────────────────
+# 2. etl-transaction-sync — Nightly ETL CronJob
+# Runs on spot-pool. Reads from Cloud SQL, writes to BigQuery.
+# ─────────────────────────────────────────────────────────────
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etl-transaction-sync-config
+  namespace: team-data
+  labels:
+    app: etl-transaction-sync
+    team: data
+data:
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  BQ_WRITE_DISPOSITION: "WRITE_APPEND"
+  BQ_CREATE_DISPOSITION: "CREATE_IF_NEEDED"
+  BATCH_SIZE: "5000"
+  MAX_PARALLEL_WORKERS: "8"
+  OTEL_SERVICE_NAME: "etl-transaction-sync"
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etl-transaction-sync
+  namespace: team-data
+  labels:
+    app: etl-transaction-sync
+    team: data
+spec:
+  # Run at 01:00 UTC daily
+  schedule: "0 1 * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid       # never run two at the same time
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 3600   # fail if can't start within 1h of scheduled time
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 14400   # fail job if running > 4 hours
+      ttlSecondsAfterFinished: 86400 # clean up pods 24h after completion
+      template:
+        metadata:
+          labels:
+            app: etl-transaction-sync
+            team: data
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "9091"
+        spec:
+          serviceAccountName: data-etl-ksa
+          restartPolicy: OnFailure
+          # Run on spot nodes — batch job can tolerate interruption
+          nodeSelector:
+            cloud.google.com/gke-nodepool: spot-pool
+          tolerations:
+            - key: cloud.google.com/gke-spot
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 3000
+            fsGroup: 2000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: etl-transaction-sync
+              image: europe-west1-docker.pkg.dev/myorg-shared-services/myorg-prod-containers/etl-transaction-sync:1.0.0
+              envFrom:
+                - configMapRef:
+                    name: etl-transaction-sync-config
+              env:
+                - name: BQ_PROJECT_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: data-warehouse-credentials
+                      key: project-id
+                - name: BQ_DATASET_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: data-warehouse-credentials
+                      key: dataset-id
+                - name: PUBSUB_SUBSCRIPTION_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: data-pubsub-credentials
+                      key: subscription-id
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 4Gi
+                limits:
+                  cpu: "8"
+                  memory: 16Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                - name: work
+                  mountPath: /var/lib/etl
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            - name: work
+              emptyDir:
+                sizeLimit: 20Gi
+
+
+# ─────────────────────────────────────────────────────────────
+# 3. spark-aggregation — On-demand Spark Job (triggered via API)
+# Runs on memory-pool for large in-memory aggregations.
+# ─────────────────────────────────────────────────────────────
+
+---
+# Job template — triggered by the pipeline-api or CI
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spark-aggregation-weekly       # CI creates with unique suffix
+  namespace: team-data
+  labels:
+    app: spark-aggregation
+    team: data
+    job-type: weekly-aggregate
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 21600         # max 6 hours
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: spark-aggregation
+        team: data
+    spec:
+      serviceAccountName: data-etl-ksa
+      restartPolicy: Never
+      # Memory-pool: high-memory nodes for large Spark jobs
+      nodeSelector:
+        cloud.google.com/gke-nodepool: memory-pool
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: memory-optimized
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-etl
+          image: europe-west1-docker.pkg.dev/myorg-shared-services/myorg-prod-containers/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Wait for today's ETL job to complete before running aggregation
+              kubectl wait --for=condition=complete \
+                job/etl-transaction-sync \
+                -n team-data \
+                --timeout=7200s
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      containers:
+        - name: spark-aggregation
+          image: europe-west1-docker.pkg.dev/myorg-shared-services/myorg-prod-containers/spark-aggregation:1.0.0
+          env:
+            - name: SPARK_DRIVER_MEMORY
+              value: "8g"
+            - name: SPARK_EXECUTOR_MEMORY
+              value: "12g"
+            - name: SPARK_EXECUTOR_CORES
+              value: "4"
+            - name: SPARK_NUM_EXECUTORS
+              value: "4"
+            - name: BQ_PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: data-warehouse-credentials
+                  key: project-id
+            - name: BQ_DATASET_ID
+              valueFrom:
+                secretKeyRef:
+                  name: data-warehouse-credentials
+                  key: dataset-id
+            - name: OUTPUT_TABLE
+              value: "weekly_aggregates"
+            - name: JOB_DATE
+              value: ""   # injected by CI at trigger time
+          resources:
+            requests:
+              cpu: "8"
+              memory: 40Gi
+            limits:
+              cpu: "16"
+              memory: 60Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # Spark needs tmp write access
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: spark-tmp
+              mountPath: /tmp
+            - name: spark-work
+              mountPath: /var/lib/spark/work
+      volumes:
+        - name: spark-tmp
+          emptyDir: {}
+        - name: spark-work
+          emptyDir:
+            sizeLimit: 100Gi
+      terminationGracePeriodSeconds: 120

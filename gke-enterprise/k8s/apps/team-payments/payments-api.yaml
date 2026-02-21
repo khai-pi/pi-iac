@@ -1,0 +1,517 @@
+# ============================================================
+# payments-api — Production Application Manifests
+# Includes: Rollout, Service, HPA, PDB, VPA,
+#           HTTPRoute, ServiceMonitor, ConfigMap
+# ============================================================
+
+---
+# ── ConfigMap ─────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-api-config
+  namespace: team-payments
+  labels:
+    app: payments-api
+    team: payments
+data:
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  HTTP_PORT: "8080"
+  GRPC_PORT: "9090"
+  METRICS_PORT: "9091"
+  MAX_CONNECTIONS: "200"
+  IDLE_TIMEOUT: "60s"
+  SHUTDOWN_TIMEOUT: "30s"
+  OTEL_SERVICE_NAME: "payments-api"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.monitoring.svc.cluster.local:4317"
+  OTEL_RESOURCE_ATTRIBUTES: "team=payments,environment=prod"
+  FEATURE_FLAG_NEW_CHECKOUT: "false"
+  FEATURE_FLAG_3DS2: "true"
+
+---
+# ── Argo Rollout (replaces Deployment for canary delivery) ───
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: payments-api
+  namespace: team-payments
+  labels:
+    app: payments-api
+    team: payments
+    version: "1.0.0"
+spec:
+  replicas: 6
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: payments-api
+  template:
+    metadata:
+      labels:
+        app: payments-api
+        team: payments
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: payments-ksa
+      # Schedule on general-pool only
+      nodeSelector:
+        cloud.google.com/gke-nodepool: general-pool
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: payments-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: payments-api
+          image: europe-west1-docker.pkg.dev/myorg-shared-services/myorg-prod-containers/payments-api:1.0.0
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: grpc
+              containerPort: 9090
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: payments-api-config
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: payments-db-credentials
+                  key: host
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: payments-db-credentials
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: payments-db-credentials
+                  key: password
+            - name: STRIPE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: payments-stripe-key
+                  key: api-key
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/app
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir:
+            sizeLimit: 256Mi
+      terminationGracePeriodSeconds: 60
+  strategy:
+    canary:
+      # Traffic routing via Argo Rollouts + Service mesh
+      trafficRouting:
+        istio:
+          virtualService:
+            name: payments-api-vsvc
+            routes:
+              - primary
+          destinationRule:
+            name: payments-api-dr
+            canarySubsetName: canary
+            stableSubsetName: stable
+      # Analysis during each canary step
+      analysis:
+        templates:
+          - templateName: success-rate
+          - templateName: latency-p99
+        startingStep: 1
+        args:
+          - name: service-name
+            value: payments-api
+          - name: namespace
+            value: team-payments
+      steps:
+        - setWeight: 5
+        - pause: {duration: 5m}
+        - setWeight: 25
+        - pause: {duration: 10m}
+        - setWeight: 50
+        - pause: {duration: 10m}
+        - setWeight: 100
+      # Auto-rollback on analysis failure
+      autoPromotionEnabled: false
+
+---
+# ── AnalysisTemplates ────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: team-payments
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+  metrics:
+    - name: success-rate
+      interval: 1m
+      successCondition: result[0] >= 0.99
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{
+              namespace="{{ args.namespace }}",
+              service="{{ args.service-name }}",
+              status!~"5.."
+            }[5m]))
+            /
+            sum(rate(http_requests_total{
+              namespace="{{ args.namespace }}",
+              service="{{ args.service-name }}"
+            }[5m]))
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: latency-p99
+  namespace: team-payments
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+  metrics:
+    - name: latency-p99
+      interval: 1m
+      successCondition: result[0] <= 1.0
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{
+                namespace="{{ args.namespace }}",
+                service="{{ args.service-name }}"
+              }[5m])) by (le)
+            )
+
+---
+# ── Services ─────────────────────────────────────────────────
+
+# Stable service — points to stable pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-api-stable
+  namespace: team-payments
+  labels:
+    app: payments-api
+spec:
+  selector:
+    app: payments-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+    - name: metrics
+      port: 9091
+      targetPort: 9091
+  type: ClusterIP
+
+---
+# Canary service — Argo Rollouts shifts traffic here during rollout
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-api-canary
+  namespace: team-payments
+  labels:
+    app: payments-api
+spec:
+  selector:
+    app: payments-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
+
+---
+# ── Istio VirtualService for canary traffic splitting ────────
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: payments-api-vsvc
+  namespace: team-payments
+spec:
+  hosts:
+    - payments-api-stable
+  http:
+    - name: primary
+      route:
+        - destination:
+            host: payments-api-stable
+            subset: stable
+          weight: 100
+        - destination:
+            host: payments-api-canary
+            subset: canary
+          weight: 0
+
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: payments-api-dr
+  namespace: team-payments
+spec:
+  host: payments-api-stable
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      http:
+        http2MaxRequests: 500
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 10s
+      baseEjectionTime: 30s
+  subsets:
+    - name: stable
+      labels:
+        app: payments-api
+    - name: canary
+      labels:
+        app: payments-api
+
+---
+# ── HTTPRoute — external traffic entry ───────────────────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: payments-api
+  namespace: team-payments
+spec:
+  parentRefs:
+    - name: platform-external-gateway
+      namespace: ingress
+  hostnames:
+    - "api.payments.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/payments
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            add:
+              - name: X-Team
+                value: payments
+      backendRefs:
+        - name: payments-api-stable
+          port: 80
+
+---
+# ── HorizontalPodAutoscaler ───────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payments-api-hpa
+  namespace: team-payments
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: payments-api
+  minReplicas: 6
+  maxReplicas: 50
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "1000"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+      selectPolicy: Min
+
+---
+# ── PodDisruptionBudget ───────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments-api-pdb
+  namespace: team-payments
+spec:
+  minAvailable: "50%"
+  selector:
+    matchLabels:
+      app: payments-api
+
+---
+# ── VerticalPodAutoscaler (recommendation mode) ──────────────
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: payments-api-vpa
+  namespace: team-payments
+spec:
+  targetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: payments-api
+  updatePolicy:
+    updateMode: "Off"    # recommendations only — team reviews before applying
+  resourcePolicy:
+    containerPolicies:
+      - containerName: payments-api
+        minAllowed:
+          cpu: 100m
+          memory: 128Mi
+        maxAllowed:
+          cpu: "2"
+          memory: 2Gi
+        controlledResources: ["cpu", "memory"]
+
+---
+# ── ServiceMonitor — Prometheus scraping config ───────────────
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: payments-api
+  namespace: team-payments
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: payments-api
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+      scheme: http
+
+---
+# ── AuthorizationPolicy — restrict inbound to gateway only ───
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: payments-api-allow-ingress
+  namespace: team-payments
+spec:
+  selector:
+    matchLabels:
+      app: payments-api
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/ingress/sa/gateway-sa"
+              - "cluster.local/ns/team-payments/sa/payments-ksa"
+      to:
+        - operation:
+            ports: ["8080", "9090"]

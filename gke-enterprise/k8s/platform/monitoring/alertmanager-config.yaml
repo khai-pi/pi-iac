@@ -1,0 +1,133 @@
+# ============================================================
+# Alertmanager Configuration
+# Routes alerts to PagerDuty and Slack by severity.
+# Webhook URL is pulled from Secret Manager via ESO.
+# ============================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+      slack_api_url_file: /etc/alertmanager/secrets/webhook-url
+
+    templates:
+      - '/etc/alertmanager/templates/*.tmpl'
+
+    route:
+      group_by: ['alertname', 'namespace', 'severity']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: slack-platform-p3
+
+      routes:
+        # P1 — page immediately
+        - matchers:
+            - severity = P1
+          receiver: pagerduty-p1
+          continue: true
+        - matchers:
+            - severity = P1
+          receiver: slack-incidents
+          group_wait: 0s
+
+        # P2 — page within 30 min
+        - matchers:
+            - severity = P2
+          receiver: pagerduty-p2
+          continue: true
+        - matchers:
+            - severity = P2
+          receiver: slack-incidents
+
+        # P3 — Slack only
+        - matchers:
+            - severity = P3
+          receiver: slack-platform-p3
+
+        # P4 — weekly digest (Slack)
+        - matchers:
+            - severity = P4
+          receiver: slack-platform-p4
+          group_wait: 1h
+          group_interval: 24h
+          repeat_interval: 168h   # weekly
+
+        # Security alerts — security channel
+        - matchers:
+            - team = security
+          receiver: slack-security
+          continue: true
+
+    receivers:
+      - name: pagerduty-p1
+        pagerduty_configs:
+          - routing_key_file: /etc/alertmanager/secrets/pagerduty-key
+            severity: critical
+            description: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+            details:
+              runbook: '{{ range .Alerts }}{{ .Annotations.runbook }}{{ end }}'
+              namespace: '{{ range .Alerts }}{{ .Labels.namespace }}{{ end }}'
+
+      - name: pagerduty-p2
+        pagerduty_configs:
+          - routing_key_file: /etc/alertmanager/secrets/pagerduty-key
+            severity: warning
+            description: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+
+      - name: slack-incidents
+        slack_configs:
+          - channel: '#incidents-prod'
+            send_resolved: true
+            icon_emoji: ':fire:'
+            title: '[{{ .Status | toUpper }}] {{ .CommonLabels.severity }} — {{ .CommonAnnotations.summary }}'
+            text: |
+              *Description:* {{ range .Alerts }}{{ .Annotations.description }}{{ end }}
+              *Runbook:* {{ range .Alerts }}{{ .Annotations.runbook }}{{ end }}
+              *Namespace:* {{ .CommonLabels.namespace }}
+              *Labels:* {{ range .CommonLabels.SortedPairs }}{{ .Name }}={{ .Value }} {{ end }}
+
+      - name: slack-platform-p3
+        slack_configs:
+          - channel: '#platform-alerts'
+            send_resolved: true
+            icon_emoji: ':warning:'
+            title: '[{{ .Status | toUpper }}] {{ .CommonAnnotations.summary }}'
+            text: |
+              {{ range .Alerts }}{{ .Annotations.description }}{{ end }}
+
+      - name: slack-platform-p4
+        slack_configs:
+          - channel: '#platform-alerts'
+            send_resolved: false
+            icon_emoji: ':information_source:'
+            title: 'Weekly digest: {{ .CommonAnnotations.summary }}'
+
+      - name: slack-security
+        slack_configs:
+          - channel: '#security-alerts'
+            send_resolved: true
+            icon_emoji: ':lock:'
+            title: '[SECURITY] {{ .CommonAnnotations.summary }}'
+            text: |
+              {{ range .Alerts }}{{ .Annotations.description }}{{ end }}
+
+    inhibit_rules:
+      # Inhibit P3/P4 alerts if P1 is firing for same namespace
+      - source_matchers:
+          - severity = P1
+        target_matchers:
+          - severity =~ P3|P4
+        equal: ['namespace']
+      # Inhibit P3/P4 if P2 is firing for same namespace
+      - source_matchers:
+          - severity = P2
+        target_matchers:
+          - severity = P4
+        equal: ['namespace']

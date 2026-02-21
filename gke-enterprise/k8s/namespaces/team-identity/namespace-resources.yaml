@@ -1,0 +1,257 @@
+# ============================================================
+# Namespace: team-identity
+# ============================================================
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: identity-quota
+  namespace: team-identity
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    count/pods: "50"
+    count/services: "20"
+    count/secrets: "50"
+    count/configmaps: "50"
+    persistentvolumeclaims: "10"
+    requests.storage: 500Gi
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: identity-limits
+  namespace: team-identity
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "4"
+        memory: 8Gi
+      min:
+        cpu: 10m
+        memory: 32Mi
+
+---
+# Default deny all
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: team-identity
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: team-identity
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: team-identity
+spec:
+  podSelector: {}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+  policyTypes: [Egress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-gateway
+  namespace: team-identity
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: team-payments
+  policyTypes: [Ingress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: team-identity
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+        - port: 8080
+        - port: 15090
+  policyTypes: [Ingress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gcp-apis-egress
+  namespace: team-identity
+spec:
+  podSelector: {}
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+  policyTypes: [Egress]
+
+---
+# RBAC
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: namespace-admin
+  namespace: team-identity
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: developer
+  namespace: team-identity
+rules:
+  - apiGroups: ["", "apps", "batch", "autoscaling", "networking.k8s.io", "argoproj.io"]
+    resources: ["pods", "pods/log", "pods/exec", "pods/portforward",
+                "deployments", "replicasets", "statefulsets", "services",
+                "configmaps", "events", "horizontalpodautoscalers", "jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/portforward"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: identity-admins
+  namespace: team-identity
+subjects:
+  - kind: Group
+    name: identity-leads@example.com
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: namespace-admin
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: identity-developers
+  namespace: team-identity
+subjects:
+  - kind: Group
+    name: identity-devs@example.com
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: developer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Workload Identity SA
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: identity-ksa
+  namespace: team-identity
+  annotations:
+    iam.gke.io/gcp-service-account: identity-gsa@myorg-gke-prod.iam.gserviceaccount.com
+
+---
+# ExternalSecrets
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: identity-jwt-signing-key
+  namespace: team-identity
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-secretmanager
+    kind: ClusterSecretStore
+  target:
+    name: identity-jwt-signing-key
+    creationPolicy: Owner
+  data:
+    - secretKey: private-key
+      remoteRef:
+        key: identity-jwt-private-key
+    - secretKey: public-key
+      remoteRef:
+        key: identity-jwt-public-key
+
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: identity-oauth-credentials
+  namespace: team-identity
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-secretmanager
+    kind: ClusterSecretStore
+  target:
+    name: identity-oauth-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: client-id
+      remoteRef:
+        key: identity-google-oauth-client-id
+    - secretKey: client-secret
+      remoteRef:
+        key: identity-google-oauth-client-secret

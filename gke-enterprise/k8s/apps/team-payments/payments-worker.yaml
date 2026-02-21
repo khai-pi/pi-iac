@@ -1,0 +1,230 @@
+# ============================================================
+# payments-worker — Background Transaction Processor
+# Runs on spot-pool to save cost.
+# Uses StatefulSet for ordered processing guarantees.
+# ============================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-worker-config
+  namespace: team-payments
+  labels:
+    app: payments-worker
+    team: payments
+data:
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  METRICS_PORT: "9091"
+  WORKER_CONCURRENCY: "10"
+  BATCH_SIZE: "100"
+  POLL_INTERVAL: "5s"
+  MAX_RETRY_ATTEMPTS: "3"
+  RETRY_BACKOFF: "exponential"
+  DEAD_LETTER_TOPIC: "payments-dlq"
+  OTEL_SERVICE_NAME: "payments-worker"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.monitoring.svc.cluster.local:4317"
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: payments-worker
+  namespace: team-payments
+  labels:
+    app: payments-worker
+    team: payments
+spec:
+  serviceName: payments-worker
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payments-worker
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: payments-worker
+        team: payments
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+    spec:
+      serviceAccountName: payments-ksa
+      # Prefer spot nodes for cost savings — tolerate spot eviction
+      nodeSelector:
+        cloud.google.com/gke-nodepool: spot-pool
+      tolerations:
+        - key: cloud.google.com/gke-spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: payments-worker
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: payments-worker
+          image: europe-west1-docker.pkg.dev/myorg-shared-services/myorg-prod-containers/payments-worker:1.0.0
+          ports:
+            - name: metrics
+              containerPort: 9091
+          envFrom:
+            - configMapRef:
+                name: payments-worker-config
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: payments-db-credentials
+                  key: host
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: payments-db-credentials
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: payments-db-credentials
+                  key: password
+            - name: STRIPE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: payments-stripe-key
+                  key: api-key
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9091
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 9091
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Allow in-flight transactions to complete
+              exec:
+                command: ["/bin/sh", "-c", "sleep 30"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: worker-data
+              mountPath: /var/lib/worker
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      terminationGracePeriodSeconds: 90
+  volumeClaimTemplates:
+    - metadata:
+        name: worker-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard-rwo
+        resources:
+          requests:
+            storage: 10Gi
+
+---
+# Headless service for StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-worker
+  namespace: team-payments
+  labels:
+    app: payments-worker
+spec:
+  clusterIP: None
+  selector:
+    app: payments-worker
+  ports:
+    - name: metrics
+      port: 9091
+
+---
+# PDB — at least 2 workers always running
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments-worker-pdb
+  namespace: team-payments
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: payments-worker
+
+---
+# HPA for worker pods
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payments-worker-hpa
+  namespace: team-payments
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: payments-worker
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: pubsub_subscription_backlog
+        target:
+          type: AverageValue
+          averageValue: "500"
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 600   # slow scale-down for workers

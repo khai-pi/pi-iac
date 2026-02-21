@@ -1,0 +1,398 @@
+# ============================================================
+# identity-service — Auth / Token Service
+# Stateless API — Rollout with canary strategy.
+# High availability: minReplicas=4, spread across 3 zones.
+# ============================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: identity-service-config
+  namespace: team-identity
+  labels:
+    app: identity-service
+    team: identity
+data:
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  HTTP_PORT: "8080"
+  METRICS_PORT: "9091"
+  TOKEN_EXPIRY: "3600"
+  REFRESH_TOKEN_EXPIRY: "2592000"
+  BCRYPT_COST: "12"
+  RATE_LIMIT_REQUESTS: "100"
+  RATE_LIMIT_WINDOW: "1m"
+  OTEL_SERVICE_NAME: "identity-service"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.monitoring.svc.cluster.local:4317"
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: identity-service
+  namespace: team-identity
+  labels:
+    app: identity-service
+    team: identity
+spec:
+  replicas: 4
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: identity-service
+  template:
+    metadata:
+      labels:
+        app: identity-service
+        team: identity
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+    spec:
+      serviceAccountName: identity-ksa
+      nodeSelector:
+        cloud.google.com/gke-nodepool: general-pool
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: identity-service
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: identity-service
+          image: europe-west1-docker.pkg.dev/myorg-shared-services/myorg-prod-containers/identity-service:1.0.0
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9091
+          envFrom:
+            - configMapRef:
+                name: identity-service-config
+          env:
+            - name: JWT_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: identity-jwt-signing-key
+                  key: private-key
+            - name: JWT_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: identity-jwt-signing-key
+                  key: public-key
+            - name: OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: identity-oauth-credentials
+                  key: client-id
+            - name: OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: identity-oauth-credentials
+                  key: client-secret
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 8
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      terminationGracePeriodSeconds: 45
+  strategy:
+    canary:
+      trafficRouting:
+        istio:
+          virtualService:
+            name: identity-service-vsvc
+            routes:
+              - primary
+          destinationRule:
+            name: identity-service-dr
+            canarySubsetName: canary
+            stableSubsetName: stable
+      analysis:
+        templates:
+          - templateName: identity-success-rate
+        startingStep: 1
+      steps:
+        - setWeight: 10
+        - pause: {duration: 5m}
+        - setWeight: 30
+        - pause: {duration: 10m}
+        - setWeight: 100
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: identity-success-rate
+  namespace: team-identity
+spec:
+  metrics:
+    - name: success-rate
+      interval: 1m
+      successCondition: result[0] >= 0.999    # 99.9% SLO for auth service
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{
+              namespace="team-identity",
+              service="identity-service-stable",
+              status!~"5.."
+            }[5m]))
+            /
+            sum(rate(http_requests_total{
+              namespace="team-identity",
+              service="identity-service-stable"
+            }[5m]))
+
+---
+# Stable service
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity-service-stable
+  namespace: team-identity
+  labels:
+    app: identity-service
+spec:
+  selector:
+    app: identity-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: metrics
+      port: 9091
+  type: ClusterIP
+
+---
+# Canary service
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity-service-canary
+  namespace: team-identity
+  labels:
+    app: identity-service
+spec:
+  selector:
+    app: identity-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: identity-service-vsvc
+  namespace: team-identity
+spec:
+  hosts:
+    - identity-service-stable
+  http:
+    - name: primary
+      route:
+        - destination:
+            host: identity-service-stable
+            subset: stable
+          weight: 100
+        - destination:
+            host: identity-service-canary
+            subset: canary
+          weight: 0
+
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: identity-service-dr
+  namespace: team-identity
+spec:
+  host: identity-service-stable
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      http:
+        http2MaxRequests: 1000
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 10s
+      baseEjectionTime: 60s
+  subsets:
+    - name: stable
+      labels:
+        app: identity-service
+    - name: canary
+      labels:
+        app: identity-service
+
+---
+# External HTTPRoute
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: identity-service
+  namespace: team-identity
+spec:
+  parentRefs:
+    - name: platform-external-gateway
+      namespace: ingress
+  hostnames:
+    - "api.identity.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/auth
+        - path:
+            type: PathPrefix
+            value: /v1/tokens
+        - path:
+            type: PathPrefix
+            value: /.well-known/jwks.json
+      backendRefs:
+        - name: identity-service-stable
+          port: 80
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: identity-service-hpa
+  namespace: team-identity
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: identity-service
+  minReplicas: 4
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 55
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "500"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30    # auth: scale up quickly
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 600
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: identity-service-pdb
+  namespace: team-identity
+spec:
+  minAvailable: 3     # always keep 3 running for auth HA
+  selector:
+    matchLabels:
+      app: identity-service
+
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: identity-service-vpa
+  namespace: team-identity
+spec:
+  targetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: identity-service
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+      - containerName: identity-service
+        minAllowed:
+          cpu: 100m
+          memory: 128Mi
+        maxAllowed:
+          cpu: "2"
+          memory: 1Gi
+
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: identity-service-allow
+  namespace: team-identity
+spec:
+  selector:
+    matchLabels:
+      app: identity-service
+  action: ALLOW
+  rules:
+    # External traffic via gateway
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/ingress/sa/gateway-sa"
+    # Internal calls from payments (token validation)
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/team-payments/sa/payments-ksa"
+      to:
+        - operation:
+            paths: ["/v1/tokens/validate", "/v1/tokens/refresh"]
+            ports: ["8080"]

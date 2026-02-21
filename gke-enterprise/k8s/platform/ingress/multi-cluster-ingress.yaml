@@ -1,0 +1,90 @@
+# ============================================================
+# Multi-cluster Ingress & GKE Fleet
+# Active/active routing across primary (europe-west1)
+# and DR (us-central1) clusters.
+# Apply to the Fleet host project, not individual clusters.
+# ============================================================
+
+---
+# MultiClusterIngress — global anycast load balancer
+apiVersion: networking.gke.io/v1
+kind: MultiClusterIngress
+metadata:
+  name: platform-mci
+  namespace: ingress
+  annotations:
+    networking.gke.io/static-ip: "platform-global-ip"
+    networking.gke.io/pre-shared-certs: "platform-cert-map"
+spec:
+  template:
+    spec:
+      backend:
+        serviceName: platform-mcs
+        servicePort: 80
+
+---
+# MultiClusterService — backend service for MCI
+# References services in both clusters via the fleet
+apiVersion: networking.gke.io/v1
+kind: MultiClusterService
+metadata:
+  name: platform-mcs
+  namespace: ingress
+  annotations:
+    # Expose to both clusters in the fleet
+    networking.gke.io/app-protocols: '{"http":"HTTP","https":"HTTPS"}'
+spec:
+  template:
+    spec:
+      selector:
+        app: platform-external-gateway
+      ports:
+        - name: http
+          protocol: TCP
+          port: 80
+        - name: https
+          protocol: TCP
+          port: 443
+
+---
+# ── Health Check Policy ───────────────────────────────────────
+# Cloud Load Balancer health check for backend clusters
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: platform-health-check
+  namespace: ingress
+spec:
+  default:
+    checkIntervalSec: 10
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+    config:
+      type: HTTP
+      httpHealthCheck:
+        requestPath: /healthz
+        port: 8080
+  targetRef:
+    group: ""
+    kind: Service
+    name: platform-mcs
+
+---
+# ── BackendPolicy — connection settings per region ───────────
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: platform-backend-policy
+  namespace: ingress
+spec:
+  default:
+    connectionDraining:
+      drainingTimeoutSec: 60
+    logging:
+      enabled: true
+      sampleRate: 0.1
+  targetRef:
+    group: "networking.gke.io"
+    kind: MultiClusterService
+    name: platform-mcs

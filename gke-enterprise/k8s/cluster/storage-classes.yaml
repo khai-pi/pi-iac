@@ -1,0 +1,73 @@
+# ============================================================
+# StorageClasses
+# Standard, SSD, and regional (replicated) options.
+# ============================================================
+
+---
+# Standard HDD — cost-efficient for general workloads
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard-rwo
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-balanced
+  replication-type: none
+  disk-encryption-key: projects/myorg-gke-prod/locations/europe-west1/keyRings/gke-keyring/cryptoKeys/disk-encryption-key
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer  # schedule pod first, then create disk in same zone
+
+---
+# SSD — for latency-sensitive workloads (databases, caches)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ssd-rwo
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-ssd
+  replication-type: none
+  disk-encryption-key: projects/myorg-gke-prod/locations/europe-west1/keyRings/gke-keyring/cryptoKeys/disk-encryption-key
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+
+---
+# Regional SSD — replicated across 2 zones for high durability
+# Use for stateful workloads that must survive a zone failure
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ssd-rwx-regional
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-ssd
+  replication-type: regional-pd
+  disk-encryption-key: projects/myorg-gke-prod/locations/europe-west1/keyRings/gke-keyring/cryptoKeys/disk-encryption-key
+reclaimPolicy: Retain   # Retain for replicated disks — don't auto-delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+allowedTopologies:
+  - matchLabelExpressions:
+      - key: topology.kubernetes.io/zone
+        values:
+          - europe-west1-b
+          - europe-west1-c
+          - europe-west1-d
+
+---
+# Filestore (NFS) — ReadWriteMany for shared access
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: filestore-rwm
+provisioner: filestore.csi.storage.gke.io
+parameters:
+  tier: standard
+  network: projects/myorg-shared-vpc-prod/global/networks/shared-vpc
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
